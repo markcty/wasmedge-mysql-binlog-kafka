@@ -1,86 +1,94 @@
 use mysql_cdc::binlog_client::BinlogClient;
 use mysql_cdc::binlog_options::BinlogOptions;
+use mysql_cdc::events::binlog_event::BinlogEvent;
+use mysql_cdc::events::event_header::EventHeader;
 use mysql_cdc::providers::mariadb::gtid::gtid_list::GtidList;
 use mysql_cdc::providers::mysql::gtid::gtid_set::GtidSet;
 use mysql_cdc::replica_options::ReplicaOptions;
 use mysql_cdc::ssl_mode::SslMode;
-use mysql_cdc::events::binlog_event::BinlogEvent;
-use mysql_cdc::events::event_header::EventHeader;
 
-use std::collections::BTreeMap;
-use std::{thread, time::Duration};
+use chrono::{TimeZone, Utc};
+use rskafka::client::partition::{OffsetAt, PartitionClient};
+use rskafka::client::Client;
 use rskafka::{
     client::{
-        ClientBuilder,
         partition::{Compression, UnknownTopicHandling},
+        ClientBuilder,
     },
     record::Record,
 };
-use chrono::{ TimeZone, Utc };
-use rskafka::client::Client;
-use rskafka::client::partition::{OffsetAt, PartitionClient};
+use std::collections::BTreeMap;
+use std::{thread, time::Duration};
 
 struct KafkaProducer {
     client: Client,
-    topic: Option<String>
+    topic: Option<String>,
 }
 
 impl KafkaProducer {
-
     async fn connect(url: String) -> Self {
-       KafkaProducer {
-           client: ClientBuilder::new(vec![url]).build().await.expect("Couldn't connect to kafka"),
-           topic: None
-       }
+        KafkaProducer {
+            client: ClientBuilder::new(vec![url])
+                .build()
+                .await
+                .expect("Couldn't connect to kafka"),
+            topic: None,
+        }
     }
 
-    async fn create_topic(&mut self, topic_name: &str){
+    async fn create_topic(&mut self, topic_name: &str) {
         let topics = self.client.list_topics().await.unwrap();
 
         for topic in topics {
             if topic.name.eq(&topic_name.to_string()) {
                 self.topic = Some(topic_name.to_string());
                 println!("Topic already exist in Kafka");
-                return
+                return;
             }
         }
 
-        let controller_client = self.client.controller_client().expect("Couldn't create controller client kafka");
-        controller_client.create_topic(
-            topic_name,
-            1,      // partitions
-            1,      // replication factor
-            5_000,  // timeout (ms)
-        ).await.unwrap();
+        let controller_client = self
+            .client
+            .controller_client()
+            .expect("Couldn't create controller client kafka");
+        controller_client
+            .create_topic(
+                topic_name, 1,     // partitions
+                1,     // replication factor
+                5_000, // timeout (ms)
+            )
+            .await
+            .unwrap();
         self.topic = Some(topic_name.to_string());
     }
 
-    fn create_record(&self,headers:String,value:String) -> Record{
+    fn create_record(&self, headers: String, value: String) -> Record {
         Record {
             key: None,
             value: Some(value.into_bytes()),
-            headers: BTreeMap::from([
-                ("mysql_binlog_headers".to_owned(), headers.into_bytes()),
-            ]),
+            headers: BTreeMap::from([("mysql_binlog_headers".to_owned(), headers.into_bytes())]),
             timestamp: Utc.timestamp_millis(42),
         }
     }
 
-    async fn get_partition_client(&self,partition:i32) -> Option<PartitionClient>{
+    async fn get_partition_client(&self, partition: i32) -> Option<PartitionClient> {
         if self.topic.is_none() {
             ()
         }
 
         let topic = self.topic.as_ref().unwrap();
-        Some(self.client.partition_client(topic,partition,UnknownTopicHandling::Retry).await.expect("Couldn't fetch controller client"))
+        Some(
+            self.client
+                .partition_client(topic, partition, UnknownTopicHandling::Retry)
+                .await
+                .expect("Couldn't fetch controller client"),
+        )
     }
-
 }
 
 #[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<(),mysql_cdc::errors::Error> {
-
-    let sleep_time:u64 = std::env::var("SLEEP_TIME").unwrap().parse().unwrap();
+async fn main() -> Result<(), mysql_cdc::errors::Error> {
+    let sleep_time: u64 = std::env::var("SLEEP_TIME").unwrap().parse().unwrap();
 
     thread::sleep(Duration::from_millis(sleep_time));
     println!("Thread started");
@@ -136,18 +144,21 @@ async fn main() -> Result<(),mysql_cdc::errors::Error> {
         let (header, event) = result?;
 
         let json_event = serde_json::to_string(&event).expect("Couldn't convert sql event to json");
-        let json_header = serde_json::to_string(&header).expect("Couldn't convert sql header to json");
+        let json_header =
+            serde_json::to_string(&header).expect("Couldn't convert sql header to json");
 
-        let kafka_record = kafka_producer.create_record(json_header,json_event);
-        partitionClient.produce(vec![kafka_record],Compression::default()).await.unwrap();
-
+        let kafka_record = kafka_producer.create_record(json_header, json_event);
+        partitionClient
+            .produce(vec![kafka_record], Compression::default())
+            .await
+            .unwrap();
 
         // Consumer
         let (records, high_watermark) = partitionClient
             .fetch_records(
-                partition_offset,  // offset
-                1..100_000,  // min..max bytes
-                1_000,  // max wait time
+                partition_offset, // offset
+                1..100_000,       // min..max bytes
+                1_000,            // max wait time
             )
             .await
             .unwrap();
@@ -158,16 +169,20 @@ async fn main() -> Result<(),mysql_cdc::errors::Error> {
             let record_clone = record.clone();
             let timestamp = record_clone.record.timestamp;
             let value = record_clone.record.value.unwrap();
-            let header = record_clone.record.headers.get("mysql_binlog_headers").unwrap().clone();
+            let header = record_clone
+                .record
+                .headers
+                .get("mysql_binlog_headers")
+                .unwrap()
+                .clone();
 
             println!("============================================== Event from Apache kafka ==========================================================================");
             println!();
-            println!("Value: {}",String::from_utf8(value).unwrap());
-            println!("Timestamp: {}",timestamp);
-            println!("Headers: {}",String::from_utf8(header).unwrap());
+            println!("Value: {}", String::from_utf8(value).unwrap());
+            println!("Timestamp: {}", timestamp);
+            println!("Headers: {}", String::from_utf8(header).unwrap());
             println!();
             println!();
-
         }
 
         // After you processed the event, you need to update replication position

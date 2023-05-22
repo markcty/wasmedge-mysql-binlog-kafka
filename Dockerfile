@@ -3,6 +3,7 @@
 FROM --platform=$BUILDPLATFORM rust:latest AS buildbase
 WORKDIR /mysql-binlog-kafka
 RUN <<EOT bash
+    sed -i "s|http://deb.debian.org/debian|http://mirror.sjtu.edu.cn/debian|g" /etc/apt/sources.list
     set -ex
     apt-get update
     apt-get install -y \

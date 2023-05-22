@@ -1,0 +1,4 @@
+{
+  "rust-analyzer.check.command": "clippy --target=wasm32-wasi",
+  "rust-analyzer.check.targets": "wasm32-wasi"
+}

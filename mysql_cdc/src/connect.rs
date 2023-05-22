@@ -1,6 +1,5 @@
 // use openssl::rsa::{Padding, Rsa};
 
-use std::ops::Deref;
 use crate::binlog_client::BinlogClient;
 use crate::commands::auth_plugin_switch_command::AuthPluginSwitchCommand;
 use crate::commands::authenticate_command::AuthenticateCommand;
@@ -9,13 +8,14 @@ use crate::constants::auth_plugin_names::AuthPlugin;
 use crate::constants::database_provider::DatabaseProvider;
 use crate::constants::{auth_plugin_names, capability_flags, NULL_TERMINATOR, UTF8_MB4_GENERAL_CI};
 use crate::errors::Error;
-use crate::extensions::{check_error_packet, xor};
+use crate::extensions::check_error_packet;
 use crate::packet_channel::PacketChannel;
 use crate::responses::auth_switch_packet::AuthPluginSwitchPacket;
 use crate::responses::handshake_packet::HandshakePacket;
 use crate::responses::response_type::ResponseType;
 use crate::ssl_mode::SslMode;
 use mysql_common::crypto;
+use std::ops::Deref;
 
 impl BinlogClient {
     pub fn connect(&self) -> Result<(PacketChannel, DatabaseProvider), Error> {
@@ -149,7 +149,7 @@ impl BinlogClient {
         }
         let encrypted_pass = crypto::encrypt(&*password, public_key);
 
-        channel.write_packet(encrypted_pass.deref(),seq_num + 1);
+        channel.write_packet(encrypted_pass.deref(), seq_num + 1);
         let (packet, _seq_num) = channel.read_packet()?;
         check_error_packet(&packet, "Authentication error.")?;
         Ok(())

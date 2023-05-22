@@ -1,9 +1,6 @@
 use mysql_cdc::binlog_client::BinlogClient;
 use mysql_cdc::binlog_options::BinlogOptions;
 use mysql_cdc::events::binlog_event::BinlogEvent;
-use mysql_cdc::events::event_header::EventHeader;
-use mysql_cdc::providers::mariadb::gtid::gtid_list::GtidList;
-use mysql_cdc::providers::mysql::gtid::gtid_set::GtidSet;
 use mysql_cdc::replica_options::ReplicaOptions;
 use mysql_cdc::ssl_mode::SslMode;
 
@@ -17,8 +14,49 @@ use rskafka::{
     },
     record::Record,
 };
-use std::collections::BTreeMap;
+use sqlparser::ast::Statement;
+use sqlparser::dialect::MySqlDialect;
+use sqlparser::parser::Parser;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::{thread, time::Duration};
+
+const TABLES: &[&str] = &["paymentA", "paymentB", "paymentC"];
+
+struct LogEventClient {
+    topic: String,
+    client: PartitionClient,
+    offset: i64,
+}
+
+impl LogEventClient {
+    async fn produce_log_record(&mut self, header: String, event: String) {
+        let record = Record {
+            key: None,
+            value: Some(event.into_bytes()),
+            headers: BTreeMap::from([("mysql_binlog_headers".to_owned(), header.into_bytes())]),
+            timestamp: Utc.timestamp_millis(42),
+        };
+        self.client
+            .produce(vec![record], Compression::default())
+            .await
+            .expect("failed to produce");
+    }
+
+    async fn consume_log_records(&mut self) -> Vec<Record> {
+        let (records, high_watermark) = self
+            .client
+            .fetch_records(
+                self.offset, // offset
+                1..100_000,  // min..max bytes
+                1_000,       // max wait time
+            )
+            .await
+            .unwrap();
+
+        self.offset = high_watermark;
+        records.into_iter().map(|ro| ro.record).collect()
+    }
+}
 
 struct KafkaProducer {
     client: Client,
@@ -62,20 +100,7 @@ impl KafkaProducer {
         self.topic = Some(topic_name.to_string());
     }
 
-    fn create_record(&self, headers: String, value: String) -> Record {
-        Record {
-            key: None,
-            value: Some(value.into_bytes()),
-            headers: BTreeMap::from([("mysql_binlog_headers".to_owned(), headers.into_bytes())]),
-            timestamp: Utc.timestamp_millis(42),
-        }
-    }
-
     async fn get_partition_client(&self, partition: i32) -> Option<PartitionClient> {
-        if self.topic.is_none() {
-            ()
-        }
-
         let topic = self.topic.as_ref().unwrap();
         Some(
             self.client
@@ -123,7 +148,7 @@ async fn main() -> Result<(), mysql_cdc::errors::Error> {
         password,
         port: mysql_port.parse::<u16>().unwrap(),
         hostname: mysql_hostname,
-        database: Some(mysql_database),
+        database: Some(mysql_database.clone()),
         blocking: true,
         ssl_mode: SslMode::Disabled,
         binlog: options,
@@ -136,57 +161,110 @@ async fn main() -> Result<(), mysql_cdc::errors::Error> {
     let kafka_url = std::env::var("KAFKA_URL").unwrap();
     let mut kafka_producer = KafkaProducer::connect(kafka_url).await;
     println!("Connected to kafka server");
-    kafka_producer.create_topic("mysql_binlog_events").await;
-    let partitionClient = kafka_producer.get_partition_client(0).await.unwrap();
-    let mut partition_offset = partitionClient.get_offset(OffsetAt::Latest).await.unwrap();
+
+    // create topics for each table
+    let mut clients: HashMap<String, LogEventClient> = HashMap::new();
+    for table in TABLES {
+        let topic = format!("{mysql_database}_{table}");
+        kafka_producer.create_topic(&topic).await;
+        let partition_client = kafka_producer.get_partition_client(0).await.unwrap();
+        let offset = partition_client.get_offset(OffsetAt::Latest).await.unwrap();
+        clients.insert(
+            table.to_string(),
+            LogEventClient {
+                topic,
+                client: partition_client,
+                offset,
+            },
+        );
+    }
 
     for result in client.replicate()? {
         let (header, event) = result?;
-
         let json_event = serde_json::to_string(&event).expect("Couldn't convert sql event to json");
         let json_header =
             serde_json::to_string(&header).expect("Couldn't convert sql header to json");
 
-        let kafka_record = kafka_producer.create_record(json_header, json_event);
-        partitionClient
-            .produce(vec![kafka_record], Compression::default())
-            .await
-            .unwrap();
+        let tables = get_event_table(&event);
+        for table in tables {
+            let Some(client) = clients.get_mut(&table) else {
+                continue;
+            };
+            // produce and consume
+            client
+                .produce_log_record(json_header.clone(), json_event.clone())
+                .await;
+            let records = client.consume_log_records().await;
 
-        // Consumer
-        let (records, high_watermark) = partitionClient
-            .fetch_records(
-                partition_offset, // offset
-                1..100_000,       // min..max bytes
-                1_000,            // max wait time
-            )
-            .await
-            .unwrap();
-
-        partition_offset = high_watermark;
-
-        for record in records {
-            let record_clone = record.clone();
-            let timestamp = record_clone.record.timestamp;
-            let value = record_clone.record.value.unwrap();
-            let header = record_clone
-                .record
-                .headers
-                .get("mysql_binlog_headers")
-                .unwrap()
-                .clone();
-
-            println!("============================================== Event from Apache kafka ==========================================================================");
-            println!();
-            println!("Value: {}", String::from_utf8(value).unwrap());
-            println!("Timestamp: {}", timestamp);
-            println!("Headers: {}", String::from_utf8(header).unwrap());
-            println!();
-            println!();
+            // print record
+            for r in records {
+                println!(
+                    "===================Event from kafka topic {}===================",
+                    client.topic
+                );
+                println!();
+                println!(
+                    "Value: {}",
+                    String::from_utf8(r.value.expect("record has no value")).unwrap()
+                );
+                println!("Timestamp: {}", r.timestamp);
+                println!(
+                    "Headers: {}",
+                    String::from_utf8(
+                        r.headers
+                            .get("mysql_binlog_headers")
+                            .expect("record has no mysql_binlog_headers")
+                            .to_owned()
+                    )
+                    .unwrap()
+                );
+                println!();
+                println!();
+            }
         }
 
         // After you processed the event, you need to update replication position
         client.commit(&header, &event);
     }
     Ok(())
+}
+
+fn get_event_table(event: &BinlogEvent) -> HashSet<String> {
+    match event {
+        BinlogEvent::QueryEvent(e) => extract_tables_from_sql(&e.sql_statement),
+        _ => HashSet::new(),
+    }
+}
+
+fn extract_tables_from_sql(sql: &str) -> HashSet<String> {
+    let ast = Parser::parse_sql(&MySqlDialect {}, sql).expect("failed to parse sql");
+    let mut tables = HashSet::new();
+    for st in ast {
+        match st {
+            Statement::Insert { table_name, .. } => {
+                for table in table_name.0 {
+                    tables.insert(table.value);
+                }
+            }
+            Statement::CreateTable { name, .. } => {
+                for table in name.0 {
+                    tables.insert(table.value);
+                }
+            }
+            Statement::Query(q) => {
+                if let sqlparser::ast::SetExpr::Select(s) = *q.body {
+                    for f in s.from {
+                        if let sqlparser::ast::TableFactor::Table { name, .. } = f.relation {
+                            for table in name.0 {
+                                tables.insert(table.value);
+                            }
+                        }
+                    }
+                }
+            }
+
+            _ => {}
+        }
+    }
+    tables
 }

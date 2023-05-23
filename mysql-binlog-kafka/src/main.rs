@@ -29,7 +29,7 @@ struct LogEventClient {
 }
 
 impl LogEventClient {
-    async fn produce_log_record(&mut self, header: String, event: String) {
+    async fn produce_log_record(&self, header: String, event: String) {
         let record = Record {
             key: None,
             value: Some(event.into_bytes()),
@@ -155,7 +155,7 @@ async fn main() -> Result<(), mysql_cdc::errors::Error> {
         ..Default::default()
     };
 
-    let mut client = BinlogClient::new(options);
+    let mut binlog_client = BinlogClient::new(options);
     println!("Connected to mysql database");
 
     let kafka_url = std::env::var("KAFKA_URL").unwrap();
@@ -179,7 +179,7 @@ async fn main() -> Result<(), mysql_cdc::errors::Error> {
         );
     }
 
-    for result in client.replicate()? {
+    for result in binlog_client.replicate()? {
         let (header, event) = result?;
         let json_event = serde_json::to_string(&event).expect("Couldn't convert sql event to json");
         let json_header =
@@ -187,6 +187,7 @@ async fn main() -> Result<(), mysql_cdc::errors::Error> {
 
         let tables = get_event_table(&event);
         for table in tables {
+            // The event for tables not needed will be skipped
             let Some(client) = clients.get_mut(&table) else {
                 continue;
             };
@@ -224,7 +225,7 @@ async fn main() -> Result<(), mysql_cdc::errors::Error> {
         }
 
         // After you processed the event, you need to update replication position
-        client.commit(&header, &event);
+        binlog_client.commit(&header, &event);
     }
     Ok(())
 }
